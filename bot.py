@@ -26,6 +26,7 @@ log = logging.getLogger("scalpbot")
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 STATE_FILE = Path(os.environ.get("STATE_FILE", "state.json"))
 BINANCE_MARKET = os.environ.get("BINANCE_MARKET", "futures")  # futures | spot
+CHANNEL_ID = os.environ.get("CHANNEL_ID", "").strip()  # e.g. -1001234567890 or @mychannel
 ALLOWED = {int(x) for x in os.environ.get("ALLOWED_CHAT_IDS", "").split(",") if x.strip()}
 RR = tuple(float(x) for x in os.environ.get("TAKE_PROFIT_RR", "1,1.5,2").split(","))
 PARAMS = Params(
@@ -116,8 +117,14 @@ async def scan_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         state["last_sig"][k] = checked[k]
         save_state()
         text = signal_text(ex, sym, tf, plan, int(df["trend"].iloc[i]))
-        for chat in chats:
-            await ctx.bot.send_message(chat, text, parse_mode="HTML")
+        targets = list(chats)
+        if CHANNEL_ID and CHANNEL_ID not in map(str, targets):
+            targets.append(CHANNEL_ID)  # every watched market's signals are also posted to the channel
+        for chat in targets:
+            try:
+                await ctx.bot.send_message(chat, text, parse_mode="HTML")
+            except Exception as e:  # noqa: BLE001
+                log.warning("send to %s failed: %s", chat, e)
         log.info("signal %s %s", k, plan.side)
 
 

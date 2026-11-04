@@ -19,6 +19,7 @@ pip install -r requirements.txt
 export TELEGRAM_BOT_TOKEN=...   # create one with @BotFather
 python bot.py
 ```
+Set `CHANNEL_ID` to also post every signal to a Telegram channel (add the bot as channel admin with "Post messages").
 Commands: `/add BTCUSDT 5m blofin`, `/remove`, `/list`, `/scan ETHUSDT 15m binance`, `/chatid`.
 Optional settings are in `.env.example` (export them as env vars).
 
