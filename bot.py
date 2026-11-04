@@ -28,6 +28,8 @@ STATE_FILE = Path(os.environ.get("STATE_FILE", "state.json"))
 BINANCE_MARKET = os.environ.get("BINANCE_MARKET", "futures")  # futures | spot
 CHANNEL_ID = os.environ.get("CHANNEL_ID", "").strip()  # e.g. -1001234567890 or @mychannel
 ALLOWED = {int(x) for x in os.environ.get("ALLOWED_CHAT_IDS", "").split(",") if x.strip()}
+LEVERAGE = int(os.environ.get("LEVERAGE", 15))
+MARGIN_MODE = os.environ.get("MARGIN_MODE", "Cross").capitalize()  # Cross | Isolated
 RR = tuple(float(x) for x in os.environ.get("TAKE_PROFIT_RR", "1,1.5,2").split(","))
 PARAMS = Params(
     hilo_len=int(os.environ.get("PAC_LENGTH", 34)),
@@ -93,13 +95,20 @@ def fmt(x: float) -> str:
 def signal_text(ex: str, sym: str, tf: str, plan: TradePlan, trend: int) -> str:
     icon = "🟢" if plan.side == "LONG" else "🔴"
     tn = {1: "Uptrend", -1: "Downtrend", 0: "Transition"}[trend]
-    tps = "\n".join(f"  TP{n + 1}: <code>{fmt(t)}</code> ({r}R)" for n, (t, r) in enumerate(zip(plan.targets, plan.rr)))
+    def roi(price: float) -> float:  # % return on margin at the configured leverage
+        return abs(price - plan.entry) / plan.entry * 100 * LEVERAGE
+
+    tps = "\n".join(
+        f"  TP{n + 1}: <code>{fmt(t)}</code> ({r}R · +{roi(t):.0f}%)" for n, (t, r) in enumerate(zip(plan.targets, plan.rr))
+    )
     risk_pct = abs(plan.entry - plan.stop) / plan.entry * 100
+    warn = "\n⚠️ Stop is beyond ~liquidation distance at this leverage" if risk_pct * LEVERAGE >= 90 else ""
     return (
         f"{icon} <b>{plan.side}</b> {html.escape(sym)} · {tf} · {ex.upper()}\n"
+        f"Leverage: <b>{MARGIN_MODE} {LEVERAGE}X</b>\n"
         f"Pullback recovery · {tn}\n\n"
         f"Entry: <code>{fmt(plan.entry)}</code>\n"
-        f"Stop:  <code>{fmt(plan.stop)}</code> ({risk_pct:.2f}%)\n{tps}\n\n"
+        f"Stop:  <code>{fmt(plan.stop)}</code> ({risk_pct:.2f}% · -{roi(plan.stop):.0f}%){warn}\n{tps}\n\n"
         f"<i>Signal only, not financial advice.</i>"
     )
 
