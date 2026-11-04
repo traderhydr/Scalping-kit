@@ -121,6 +121,7 @@ def signal_text(ex: str, sym: str, tf: str, plan: TradePlan, trend: int) -> str:
     return (
         f"#{html.escape(base)}/{html.escape(quote)}\n"
         f"{plan.side}\n"
+        f"Timeframe: {tf}\n"
         f"Entry Targets:\n{num(plan.entries)}\n"
         f"Take-Profit Targets:\n{num(plan.targets)}\n"
         f"Stop Targets:\n{num([plan.stop])}\n"
@@ -158,7 +159,7 @@ async def track_trades(ctx: ContextTypes.DEFAULT_TYPE, k: str, df) -> None:
             keep.append(t)
             continue
         base, quote = exchanges.normalize_symbol(t["symbol"])
-        head = f"#{base}/{quote} {t['side']}"
+        head = f"#{base}/{quote} {t['side']} · {k.split(':')[2]}"
         long_ = t["side"] == "LONG"
         closed = False
         for row in df[df["ts"] > t["last_ts"]].itertuples():
