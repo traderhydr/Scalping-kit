@@ -21,6 +21,8 @@ from indicator import Params, compute
 from trade import TradePlan, build_plan
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)  # its request URLs contain the bot token
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("scalpbot")
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
