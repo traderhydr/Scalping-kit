@@ -43,6 +43,9 @@ PARAMS = Params(
 AUTO_COUNT = int(os.environ.get("AUTO_SCAN_COUNT", 0))            # 0 = off; e.g. 15
 AUTO_TFS = [x.strip() for x in os.environ.get("AUTO_SCAN_TIMEFRAMES", "5m").split(",") if x.strip()]
 AUTO_EXCHANGES = [x.strip() for x in os.environ.get("AUTO_SCAN_EXCHANGES", "binance").split(",") if x.strip()]
+# Non-crypto / tokenised-stock / commodity perps that rank high on volume; override with AUTO_SCAN_EXCLUDE
+AUTO_EXCLUDE = {x.strip().upper() for x in os.environ.get(
+    "AUTO_SCAN_EXCLUDE", "SOXL,SOXS,SNDK,XAU,XAG,SKHYNIX,KORU,SPCX,MU,CL,NATGAS,BZ,TSLA,NVDA,AAPL,MSTR,COIN").split(",") if x.strip()}
 AUTO_REFRESH = 3600  # seconds between re-ranking the top coins
 SCAN_EVERY = 15      # seconds between scheduler ticks
 CLOSE_GRACE = 3      # seconds to wait after a candle closes before fetching
@@ -71,7 +74,8 @@ async def auto_markets() -> list[tuple[str, str, str]]:
         ts, syms = auto_cache.get(ex, (0.0, []))
         if time.time() - ts > AUTO_REFRESH:
             try:
-                syms = await asyncio.to_thread(exchanges.top_symbols, ex, AUTO_COUNT, BINANCE_MARKET)
+                pool = await asyncio.to_thread(exchanges.top_symbols, ex, AUTO_COUNT + 60, BINANCE_MARKET)
+                syms = [x for x in pool if x[:-4] not in AUTO_EXCLUDE][:AUTO_COUNT]
                 auto_cache[ex] = (time.time(), syms)
                 log.info("auto-scan %s top %d: %s", ex, AUTO_COUNT, ",".join(syms))
             except Exception as e:  # noqa: BLE001
