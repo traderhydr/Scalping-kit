@@ -53,7 +53,7 @@ SCAN_EVERY = 15      # seconds between scheduler ticks
 CLOSE_GRACE = 3      # seconds to wait after a candle closes before fetching
 
 # ---------------------------------------------------------------- state
-state = {"watch": {}, "last_sig": {}}  # watch: chat_id -> [[exchange, symbol, tf]]; last_sig: key -> bar_ts
+state = {"watch": {}, "last_sig": {}, "open": [], "results": {"tp_hits": 0, "sl_hits": 0, "completed": 0}}  # watch: chat_id -> [[exchange, symbol, tf]]; last_sig: key -> bar_ts
 stats = {"rounds": 0, "last_scan": 0.0, "last_scanned": 0, "last_errors": 0, "signals": 0, "markets": 0}
 checked: dict[str, int] = {}           # key -> last closed bar_ts already evaluated (in-memory)
 
@@ -61,6 +61,8 @@ checked: dict[str, int] = {}           # key -> last closed bar_ts already evalu
 def load_state() -> None:
     if STATE_FILE.exists():
         state.update(json.loads(STATE_FILE.read_text()))
+    state.setdefault("open", [])
+    state.setdefault("results", {"tp_hits": 0, "sl_hits": 0, "completed": 0})
 
 
 def save_state() -> None:
@@ -134,6 +136,79 @@ def analyse(ex: str, sym: str, tf: str):
     return compute(df, PARAMS)
 
 
+MAX_TRADE_CANDLES = 500  # stop tracking a trade that has hit nothing after this many candles
+
+
+def pct(trade: dict, price: float) -> float:
+    e = trade["entries"][0]
+    return (price - e) / e * 100 * (1 if trade["side"] == "LONG" else -1)
+
+
+def roi_text(trade: dict, price: float) -> str:
+    p = pct(trade, price)
+    return f"{p:+.2f}% price · {p * LEVERAGE:+.1f}% ROI at {MARGIN_MODE} {LEVERAGE}X"
+
+
+async def track_trades(ctx: ContextTypes.DEFAULT_TYPE, k: str, df) -> None:
+    """Check candles after each open trade's signal for TP / SL hits and post updates as replies."""
+    keep = []
+    changed = False
+    for t in state["open"]:
+        if t["key"] != k:
+            keep.append(t)
+            continue
+        base, quote = exchanges.normalize_symbol(t["symbol"])
+        head = f"#{base}/{quote} {t['side']}"
+        long_ = t["side"] == "LONG"
+        closed = False
+        for row in df[df["ts"] > t["last_ts"]].itertuples():
+            t["last_ts"] = int(row.ts)
+            t["candles"] += 1
+            sl_hit = row.low <= t["stop"] if long_ else row.high >= t["stop"]
+            new_hits = []
+            idx = t["tps_hit"]
+            while idx < len(t["targets"]) and (
+                row.high >= t["targets"][idx] if long_ else row.low <= t["targets"][idx]
+            ):
+                new_hits.append(idx)
+                idx += 1
+            if not sl_hit:  # SL and TP in the same candle: can't know the order, assume the stop (conservative)
+                t["tps_hit"] = idx
+            else:
+                new_hits = []
+            msgs = []
+            for n in new_hits:
+                state["results"]["tp_hits"] += 1
+                msgs.append(f"✅ {head}\nTP{n + 1} hit 🎯\n{roi_text(t, t['targets'][n])}")
+            if sl_hit:
+                state["results"]["sl_hits"] += 1
+                after = f" (after TP{t['tps_hit']})" if t["tps_hit"] else ""
+                msgs.append(f"🛑 {head}\nStop loss hit{after}\n{roi_text(t, t['stop'])}")
+                closed = True
+            elif t["tps_hit"] >= len(t["targets"]):
+                msgs.append(f"🏆 {head}\nAll {len(t['targets'])} targets hit")
+                state["results"]["completed"] += 1
+                closed = True
+            for m in msgs:
+                for chat, mid in t["msgs"].items():
+                    try:
+                        await ctx.bot.send_message(chat, m, reply_to_message_id=mid, allow_sending_without_reply=True)
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("tp/sl update to %s failed: %s", chat, e)
+            if msgs:
+                log.info("trade update %s %s: %s", k, t["side"], msgs[-1].splitlines()[1])
+            changed = True
+            if closed:
+                break
+        if not closed and t["candles"] < MAX_TRADE_CANDLES:
+            keep.append(t)
+        elif not closed:
+            log.info("dropped stale trade %s", k)
+    if changed or len(keep) != len(state["open"]):
+        state["open"] = keep
+        save_state()
+
+
 async def scan_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     now = time.time()
     subs: dict[str, list[int]] = {}
@@ -149,7 +224,10 @@ async def scan_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 if r and r not in map(str, lst):
                     lst.append(r)
 
-    stats["markets"] = len(subs)
+    watched = set(subs)
+    for t in state["open"]:  # keep tracking trades even if the coin left the top-N list
+        subs.setdefault(t["key"], [])
+    stats["markets"] = len(watched)
     scanned = errors = 0
     for k, chats in subs.items():
         ex, sym, tf = k.split(":")
@@ -167,8 +245,9 @@ async def scan_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
             continue  # exchange hasn't published the new candle yet, retry next tick
         checked[k] = int(df["ts"].iloc[-1])
         scanned += 1
+        await track_trades(ctx, k, df)
         i = len(df) - 1
-        if df["signal"].iloc[i] == 0 or state["last_sig"].get(k) == checked[k]:
+        if k not in watched or df["signal"].iloc[i] == 0 or state["last_sig"].get(k) == checked[k]:
             continue
         plan = build_plan(df, i, PARAMS, RR, ENTRY_STEP_R)
         state["last_sig"][k] = checked[k]
@@ -177,11 +256,18 @@ async def scan_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         targets = list(chats)
         if CHANNEL_ID and CHANNEL_ID not in map(str, targets):
             targets.append(CHANNEL_ID)  # every watched market's signals are also posted to the channel
+        msg_ids = {}
         for chat in targets:
             try:
-                await ctx.bot.send_message(chat, text, parse_mode="HTML")
+                m = await ctx.bot.send_message(chat, text, parse_mode="HTML")
+                msg_ids[str(chat)] = m.message_id
             except Exception as e:  # noqa: BLE001
                 log.warning("send to %s failed: %s", chat, e)
+        state["open"].append({
+            "key": k, "symbol": sym, "side": plan.side, "entries": plan.entries, "stop": plan.stop,
+            "targets": plan.targets, "tps_hit": 0, "candles": 0, "last_ts": plan.bar_ts, "msgs": msg_ids,
+        })
+        save_state()
         stats["signals"] += 1
         log.info("signal %s %s", k, plan.side)
 
@@ -206,6 +292,8 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"Last scheduler tick: {ago}\n"
         f"Fetch errors last round: {stats['last_errors']}\n"
         f"Signals sent since start: {stats['signals']}\n"
+        f"Open trades: {len(state['open'])} · TP hits: {state['results']['tp_hits']} · "
+        f"SL hits: {state['results']['sl_hits']} · Fully completed: {state['results']['completed']}\n"
         + auto
     )
 
