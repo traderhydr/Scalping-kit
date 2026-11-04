@@ -32,7 +32,8 @@ CHANNEL_ID = os.environ.get("CHANNEL_ID", "").strip()  # e.g. -1001234567890 or 
 ALLOWED = {int(x) for x in os.environ.get("ALLOWED_CHAT_IDS", "").split(",") if x.strip()}
 LEVERAGE = int(os.environ.get("LEVERAGE", 15))
 MARGIN_MODE = os.environ.get("MARGIN_MODE", "Cross").capitalize()  # Cross | Isolated
-RR = tuple(float(x) for x in os.environ.get("TAKE_PROFIT_RR", "1,1.5,2").split(","))
+ENTRY_STEP_R = float(os.environ.get("ENTRY_STEP_R", 0.15))  # spacing of entries 2/3, in units of risk
+RR = tuple(float(x) for x in os.environ.get("TAKE_PROFIT_RR", "0.5,1,1.5,2.5").split(","))
 PARAMS = Params(
     hilo_len=int(os.environ.get("PAC_LENGTH", 34)),
     fast_ema=int(os.environ.get("FAST_EMA", 89)),
@@ -95,27 +96,22 @@ def canon(sym: str) -> str:
 
 # ---------------------------------------------------------------- formatting
 def fmt(x: float) -> str:
-    return f"{x:.6g}" if abs(x) < 1 else f"{x:,.4f}".rstrip("0").rstrip(".")
+    """Price with exchange-style precision (UNI 7.5490, BTC 67,123.40, PEPE 0.00001234)."""
+    a = abs(x)
+    d = 2 if a >= 1000 else 3 if a >= 100 else 4 if a >= 1 else 5 if a >= 0.1 else 6 if a >= 0.01 else 8
+    return f"{x:.{d}f}"
 
 
 def signal_text(ex: str, sym: str, tf: str, plan: TradePlan, trend: int) -> str:
-    icon = "🟢" if plan.side == "LONG" else "🔴"
-    tn = {1: "Uptrend", -1: "Downtrend", 0: "Transition"}[trend]
-    def roi(price: float) -> float:  # % return on margin at the configured leverage
-        return abs(price - plan.entry) / plan.entry * 100 * LEVERAGE
-
-    tps = "\n".join(
-        f"  TP{n + 1}: <code>{fmt(t)}</code> ({r}R · +{roi(t):.0f}%)" for n, (t, r) in enumerate(zip(plan.targets, plan.rr))
-    )
-    risk_pct = abs(plan.entry - plan.stop) / plan.entry * 100
-    warn = "\n⚠️ Stop is beyond ~liquidation distance at this leverage" if risk_pct * LEVERAGE >= 90 else ""
+    base, quote = exchanges.normalize_symbol(sym)
+    num = lambda xs: "\n".join(f"{n}) {fmt(v)}" for n, v in enumerate(xs, 1))  # noqa: E731
     return (
-        f"{icon} <b>{plan.side}</b> {html.escape(sym)} · {tf} · {ex.upper()}\n"
-        f"Leverage: <b>{MARGIN_MODE} {LEVERAGE}X</b>\n"
-        f"Pullback recovery · {tn}\n\n"
-        f"Entry: <code>{fmt(plan.entry)}</code>\n"
-        f"Stop:  <code>{fmt(plan.stop)}</code> ({risk_pct:.2f}% · -{roi(plan.stop):.0f}%){warn}\n{tps}\n\n"
-        f"<i>Signal only, not financial advice.</i>"
+        f"#{html.escape(base)}/{html.escape(quote)}\n"
+        f"{plan.side}\n"
+        f"Entry Targets:\n{num(plan.entries)}\n"
+        f"Take-Profit Targets:\n{num(plan.targets)}\n"
+        f"Stop Targets:\n{num([plan.stop])}\n"
+        f"Leverage: {MARGIN_MODE} ({LEVERAGE}X)"
     )
 
 
@@ -159,7 +155,7 @@ async def scan_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         i = len(df) - 1
         if df["signal"].iloc[i] == 0 or state["last_sig"].get(k) == checked[k]:
             continue
-        plan = build_plan(df, i, PARAMS, RR)
+        plan = build_plan(df, i, PARAMS, RR, ENTRY_STEP_R)
         state["last_sig"][k] = checked[k]
         save_state()
         text = signal_text(ex, sym, tf, plan, int(df["trend"].iloc[i]))
@@ -273,7 +269,7 @@ async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     recent = df.index[df["signal"] != 0]
     if len(recent):
         j = int(recent[-1])
-        plan = build_plan(df, j, PARAMS, RR)
+        plan = build_plan(df, j, PARAMS, RR, ENTRY_STEP_R)
         ago = i - j
         head += f"\nLast signal: {ago} candle(s) ago\n"
         await update.message.reply_html(head + signal_text(ex, sym, tf, plan, int(df["trend"].iloc[j])))

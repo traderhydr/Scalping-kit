@@ -37,10 +37,11 @@ def test_trade_plan_geometry():
     df = compute(synthetic())
     for i in df.index[df["signal"] != 0]:
         plan = build_plan(df, int(i), Params())
+        assert len(plan.entries) == 3 and len(plan.targets) == 4
         if plan.side == "LONG":
-            assert plan.stop < plan.entry < plan.targets[0] < plan.targets[-1]
+            assert plan.stop < plan.entries[2] < plan.entries[1] < plan.entry < plan.targets[0] < plan.targets[-1]
         else:
-            assert plan.stop > plan.entry > plan.targets[0] > plan.targets[-1]
+            assert plan.stop > plan.entries[2] > plan.entries[1] > plan.entry > plan.targets[0] > plan.targets[-1]
 
 
 def test_symbol_normalisation():
