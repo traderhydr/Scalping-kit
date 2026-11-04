@@ -12,6 +12,8 @@ import logging
 import math
 import os
 import time
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 from telegram import Update
@@ -48,6 +50,8 @@ AUTO_EXCHANGES = [x.strip() for x in os.environ.get("AUTO_SCAN_EXCHANGES", "bina
 # Non-crypto / tokenised-stock / commodity perps that rank high on volume; override with AUTO_SCAN_EXCLUDE
 AUTO_EXCLUDE = {x.strip().upper() for x in os.environ.get(
     "AUTO_SCAN_EXCLUDE", "SOXL,SOXS,SNDK,XAU,XAG,SKHYNIX,KORU,SPCX,MU,CL,NATGAS,BZ,TSLA,NVDA,AAPL,MSTR,COIN").split(",") if x.strip()}
+QUIET_ENV = os.environ.get("QUIET_HOURS", "").strip()   # e.g. 22:00-06:00 (no new signals in this window)
+QUIET_TZ_ENV = os.environ.get("QUIET_TZ", "UTC").strip()
 AUTO_REFRESH = 3600  # seconds between re-ranking the top coins
 SCAN_EVERY = 15      # seconds between scheduler ticks
 CLOSE_GRACE = 3      # seconds to wait after a candle closes before fetching
@@ -61,6 +65,14 @@ checked: dict[str, int] = {}           # key -> last closed bar_ts already evalu
 def load_state() -> None:
     if STATE_FILE.exists():
         state.update(json.loads(STATE_FILE.read_text()))
+    if "quiet" not in state:  # first run: take the environment default
+        try:
+            a, b = parse_window(QUIET_ENV) if QUIET_ENV else (None, None)
+            get_tz(QUIET_TZ_ENV)
+            state["quiet"] = {"start": a, "end": b, "tz": QUIET_TZ_ENV} if a else None
+        except Exception:  # noqa: BLE001
+            log.warning("Invalid QUIET_HOURS/QUIET_TZ, ignoring")
+            state["quiet"] = None
     state.setdefault("open", [])
     state.setdefault("results", {"tp_hits": 0, "sl_hits": 0, "completed": 0})
 
@@ -87,6 +99,30 @@ async def auto_markets() -> list[tuple[str, str, str]]:
                 log.warning("top symbols %s failed: %s", ex, e)
         out += [(ex, s, tf) for s in syms for tf in AUTO_TFS]
     return out
+
+
+def parse_window(text: str) -> tuple[str, str]:
+    a, b = text.split("-")
+    for x in (a, b):
+        datetime.strptime(x.strip(), "%H:%M")
+    return a.strip(), b.strip()
+
+
+def get_tz(name: str):
+    return timezone.utc if name.upper() == "UTC" else ZoneInfo(name)
+
+
+def in_quiet(now: float) -> bool:
+    q = state.get("quiet")
+    if not q:
+        return False
+    t = datetime.fromtimestamp(now, get_tz(q["tz"])).strftime("%H:%M")
+    return q["start"] <= t < q["end"] if q["start"] <= q["end"] else (t >= q["start"] or t < q["end"])
+
+
+def quiet_text() -> str:
+    q = state.get("quiet")
+    return f"{q['start']}-{q['end']} {q['tz']}" if q else "off"
 
 
 def key(ex: str, sym: str, tf: str) -> str:
@@ -248,6 +284,8 @@ async def scan_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         scanned += 1
         await track_trades(ctx, k, df)
         i = len(df) - 1
+        if in_quiet(now):
+            continue  # quiet hours: no new signals (open trades above are still tracked)
         if k not in watched or df["signal"].iloc[i] == 0 or state["last_sig"].get(k) == checked[k]:
             continue
         plan = build_plan(df, i, PARAMS, RR, ENTRY_STEP_R)
@@ -279,11 +317,34 @@ async def scan_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------- commands
+async def cmd_quiet(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorised(update):
+        return
+    if not ctx.args:
+        await update.message.reply_text(
+            f"Quiet hours: {quiet_text()}\nSet: /quiet 22:00-06:00 [Timezone, e.g. Asia/Karachi]\nTurn off: /quiet off")
+        return
+    if ctx.args[0].lower() == "off":
+        state["quiet"] = None
+    else:
+        try:
+            a, b = parse_window(ctx.args[0])
+            tz = ctx.args[1] if len(ctx.args) > 1 else (state.get("quiet") or {}).get("tz", QUIET_TZ_ENV)
+            get_tz(tz)
+        except Exception:  # noqa: BLE001
+            await update.message.reply_text("❌ Use: /quiet 22:00-06:00 [Timezone]  (24h time, e.g. Asia/Dubai, Europe/London, UTC)")
+            return
+        state["quiet"] = {"start": a, "end": b, "tz": tz}
+    save_state()
+    await update.message.reply_text(f"✅ Quiet hours: {quiet_text()}")
+
+
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorised(update):
         return
     ago = f"{time.time() - stats['last_scan']:.0f}s ago" if stats["last_scan"] else "never"
     newest = max(checked.values(), default=0)
+    qline = f"Quiet hours: {quiet_text()}" + (" (quiet now - no new signals)" if in_quiet(time.time()) else "") + "\n"
     auto = (f"Auto-scan: {AUTO_COUNT} coins x {','.join(AUTO_TFS)} on {','.join(AUTO_EXCHANGES)}"
             if AUTO_COUNT else "Auto-scan: off")
     await update.message.reply_text(
@@ -293,6 +354,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"Last scheduler tick: {ago}\n"
         f"Fetch errors last round: {stats['last_errors']}\n"
         f"Signals sent since start: {stats['signals']}\n"
+        + qline +
         f"Open trades: {len(state['open'])} · TP hits: {state['results']['tp_hits']} · "
         f"SL hits: {state['results']['sl_hits']} · Fully completed: {state['results']['completed']}\n"
         + auto
@@ -324,6 +386,7 @@ HELP = (
     "/list – show watchlist\n"
     "/scan &lt;symbol&gt; &lt;tf&gt; [exchange] – analyse now\n"
     "/status – is the scanner running\n"
+    "/quiet 22:00-06:00 [tz] – no new signals in this window (/quiet off)\n"
     "/chatid – show this chat's id\n\n"
     "Example: <code>/add BTCUSDT 5m blofin</code>\n"
     f"Timeframes: {', '.join(exchanges.TF_SECONDS)}\n"
@@ -412,7 +475,7 @@ def main() -> None:
     load_state()
     app = Application.builder().token(TOKEN).build()
     for name, fn in [("start", cmd_start), ("help", cmd_start), ("chatid", cmd_chatid), ("add", cmd_add),
-                     ("remove", cmd_remove), ("list", cmd_list), ("scan", cmd_scan), ("status", cmd_status)]:
+                     ("remove", cmd_remove), ("list", cmd_list), ("scan", cmd_scan), ("status", cmd_status), ("quiet", cmd_quiet)]:
         app.add_handler(CommandHandler(name, fn))
     app.job_queue.run_repeating(scan_job, interval=SCAN_EVERY, first=5)
     if AUTO_COUNT and not (CHANNEL_ID or ALLOWED):
