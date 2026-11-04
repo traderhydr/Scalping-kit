@@ -9,6 +9,7 @@ import asyncio
 import html
 import json
 import logging
+import math
 import os
 import time
 from pathlib import Path
@@ -96,9 +97,18 @@ def canon(sym: str) -> str:
 
 # ---------------------------------------------------------------- formatting
 def fmt(x: float) -> str:
-    """Price with exchange-style precision (UNI 7.5490, BTC 67,123.40, PEPE 0.00001234)."""
+    """Plain decimal price, never scientific notation (UNI 7.5490, BTC 67123.40, PEPE 0.0000050551)."""
     a = abs(x)
-    d = 2 if a >= 1000 else 3 if a >= 100 else 4 if a >= 1 else 5 if a >= 0.1 else 6 if a >= 0.01 else 8
+    if a >= 1000:
+        d = 2
+    elif a >= 100:
+        d = 3
+    elif a >= 1:
+        d = 4
+    elif a > 0:
+        d = min(12, int(-math.floor(math.log10(a))) + 4)  # keep 5 significant digits for sub-1 prices
+    else:
+        d = 4
     return f"{x:.{d}f}"
 
 
