@@ -11,6 +11,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -65,11 +66,13 @@ checked: dict[str, int] = {}           # key -> last closed bar_ts already evalu
 def load_state() -> None:
     if STATE_FILE.exists():
         state.update(json.loads(STATE_FILE.read_text()))
+    q = state.get("quiet")
+    if q and "windows" not in q:  # migrate old single-window format
+        state["quiet"] = {"windows": [[q["start"], q["end"]]], "tz": q["tz"]}
     if "quiet" not in state:  # first run: take the environment default
         try:
-            a, b = parse_window(QUIET_ENV) if QUIET_ENV else (None, None)
+            state["quiet"] = {"windows": parse_windows(QUIET_ENV), "tz": QUIET_TZ_ENV} if QUIET_ENV else None
             get_tz(QUIET_TZ_ENV)
-            state["quiet"] = {"start": a, "end": b, "tz": QUIET_TZ_ENV} if a else None
         except Exception:  # noqa: BLE001
             log.warning("Invalid QUIET_HOURS/QUIET_TZ, ignoring")
             state["quiet"] = None
@@ -101,11 +104,20 @@ async def auto_markets() -> list[tuple[str, str, str]]:
     return out
 
 
-def parse_window(text: str) -> tuple[str, str]:
-    a, b = text.split("-")
-    for x in (a, b):
-        datetime.strptime(x.strip(), "%H:%M")
-    return a.strip(), b.strip()
+WINDOW_RE = re.compile(r"(\d{1,2})[:.](\d{2})\s*-\s*(\d{1,2})[:.](\d{2})")
+
+
+def parse_windows(text: str) -> list[list[str]]:
+    """'13:00-16:15, 19.30-23.15' -> [['13:00','16:15'],['19:30','23:15']]"""
+    out = []
+    for h1, m1, h2, m2 in WINDOW_RE.findall(text):
+        a, b = f"{int(h1):02d}:{m1}", f"{int(h2):02d}:{m2}"
+        datetime.strptime(a, "%H:%M")
+        datetime.strptime(b, "%H:%M")
+        out.append([a, b])
+    if not out:
+        raise ValueError("no time windows")
+    return out
 
 
 def get_tz(name: str):
@@ -117,12 +129,12 @@ def in_quiet(now: float) -> bool:
     if not q:
         return False
     t = datetime.fromtimestamp(now, get_tz(q["tz"])).strftime("%H:%M")
-    return q["start"] <= t < q["end"] if q["start"] <= q["end"] else (t >= q["start"] or t < q["end"])
+    return any((a <= t < b) if a <= b else (t >= a or t < b) for a, b in q["windows"])
 
 
 def quiet_text() -> str:
     q = state.get("quiet")
-    return f"{q['start']}-{q['end']} {q['tz']}" if q else "off"
+    return ", ".join(f"{a}-{b}" for a, b in q["windows"]) + f" {q['tz']}" if q else "off"
 
 
 def key(ex: str, sym: str, tf: str) -> str:
@@ -322,19 +334,22 @@ async def cmd_quiet(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if not ctx.args:
         await update.message.reply_text(
-            f"Quiet hours: {quiet_text()}\nSet: /quiet 22:00-06:00 [Timezone, e.g. Asia/Karachi]\nTurn off: /quiet off")
+            f"Quiet hours: {quiet_text()}\n\nSet one or more windows plus a timezone:\n"
+            "/quiet 13:00-16:15,19:30-23:15 Europe/Madrid\n/quiet off")
         return
     if ctx.args[0].lower() == "off":
         state["quiet"] = None
     else:
         try:
-            a, b = parse_window(ctx.args[0])
-            tz = ctx.args[1] if len(ctx.args) > 1 else (state.get("quiet") or {}).get("tz", QUIET_TZ_ENV)
+            wins = parse_windows(" ".join(ctx.args))
+            tzs = [x for x in ctx.args if not WINDOW_RE.search(x) and not re.fullmatch(r"[\d:.,\s-]+", x)]
+            tz = tzs[-1] if tzs else (state.get("quiet") or {}).get("tz", QUIET_TZ_ENV)
             get_tz(tz)
         except Exception:  # noqa: BLE001
-            await update.message.reply_text("❌ Use: /quiet 22:00-06:00 [Timezone]  (24h time, e.g. Asia/Dubai, Europe/London, UTC)")
+            await update.message.reply_text(
+                "❌ Use: /quiet 13:00-16:15,19:30-23:15 Europe/Madrid  (24h times, timezone like Europe/Madrid or UTC)")
             return
-        state["quiet"] = {"start": a, "end": b, "tz": tz}
+        state["quiet"] = {"windows": wins, "tz": tz}
     save_state()
     await update.message.reply_text(f"✅ Quiet hours: {quiet_text()}")
 
@@ -386,7 +401,7 @@ HELP = (
     "/list – show watchlist\n"
     "/scan &lt;symbol&gt; &lt;tf&gt; [exchange] – analyse now\n"
     "/status – is the scanner running\n"
-    "/quiet 22:00-06:00 [tz] – no new signals in this window (/quiet off)\n"
+    "/quiet 13:00-16:15,19:30-23:15 Europe/Madrid – no new signals in these windows (/quiet off)\n"
     "/chatid – show this chat's id\n\n"
     "Example: <code>/add BTCUSDT 5m blofin</code>\n"
     f"Timeframes: {', '.join(exchanges.TF_SECONDS)}\n"
