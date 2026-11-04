@@ -36,6 +36,10 @@ PARAMS = Params(
     lookback=int(os.environ.get("PULLBACK_LOOKBACK", 3)),
     use_ha=os.environ.get("USE_HEIKIN_ASHI", "true").lower() == "true",
 )
+AUTO_COUNT = int(os.environ.get("AUTO_SCAN_COUNT", 0))            # 0 = off; e.g. 15
+AUTO_TFS = [x.strip() for x in os.environ.get("AUTO_SCAN_TIMEFRAMES", "5m").split(",") if x.strip()]
+AUTO_EXCHANGES = [x.strip() for x in os.environ.get("AUTO_SCAN_EXCHANGES", "binance").split(",") if x.strip()]
+AUTO_REFRESH = 3600  # seconds between re-ranking the top coins
 SCAN_EVERY = 15      # seconds between scheduler ticks
 CLOSE_GRACE = 3      # seconds to wait after a candle closes before fetching
 
@@ -51,6 +55,25 @@ def load_state() -> None:
 
 def save_state() -> None:
     STATE_FILE.write_text(json.dumps(state, indent=1))
+
+
+auto_cache: dict[str, tuple[float, list[str]]] = {}  # exchange -> (fetched_at, symbols)
+
+
+async def auto_markets() -> list[tuple[str, str, str]]:
+    """Top-N coins by 24h volume on each configured exchange x timeframe."""
+    out = []
+    for ex in AUTO_EXCHANGES:
+        ts, syms = auto_cache.get(ex, (0.0, []))
+        if time.time() - ts > AUTO_REFRESH:
+            try:
+                syms = await asyncio.to_thread(exchanges.top_symbols, ex, AUTO_COUNT, BINANCE_MARKET)
+                auto_cache[ex] = (time.time(), syms)
+                log.info("auto-scan %s top %d: %s", ex, AUTO_COUNT, ",".join(syms))
+            except Exception as e:  # noqa: BLE001
+                log.warning("top symbols %s failed: %s", ex, e)
+        out += [(ex, s, tf) for s in syms for tf in AUTO_TFS]
+    return out
 
 
 def key(ex: str, sym: str, tf: str) -> str:
@@ -95,6 +118,14 @@ async def scan_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     for chat, items in state["watch"].items():
         for ex, sym, tf in items:
             subs.setdefault(key(ex, sym, tf), []).append(int(chat))
+
+    if AUTO_COUNT:
+        recipients = [CHANNEL_ID] if CHANNEL_ID else [str(c) for c in ALLOWED]
+        for ex, sym, tf in await auto_markets():
+            lst = subs.setdefault(key(ex, sym, tf), [])
+            for r in recipients:
+                if r and r not in map(str, lst):
+                    lst.append(r)
 
     for k, chats in subs.items():
         ex, sym, tf = k.split(":")
@@ -244,6 +275,8 @@ def main() -> None:
                      ("remove", cmd_remove), ("list", cmd_list), ("scan", cmd_scan)]:
         app.add_handler(CommandHandler(name, fn))
     app.job_queue.run_repeating(scan_job, interval=SCAN_EVERY, first=5)
+    if AUTO_COUNT and not (CHANNEL_ID or ALLOWED):
+        log.warning("AUTO_SCAN_COUNT set but neither CHANNEL_ID nor ALLOWED_CHAT_IDS - no one to send to")
     log.info("Bot started")
     app.run_polling()
 

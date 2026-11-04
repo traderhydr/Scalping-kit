@@ -98,3 +98,34 @@ def fetch(exchange: str, symbol: str, tf: str, limit: int = 1000, binance_market
     if exchange == "blofin":
         return fetch_blofin(symbol, tf, limit)
     raise ExchangeError(f"Unknown exchange '{exchange}' (use binance or blofin)")
+
+
+STABLES = {"USDC", "FDUSD", "TUSD", "BUSD", "DAI", "USDP", "EUR", "USD1", "USDE"}
+BLOFIN_TICKERS = "https://openapi.blofin.com/api/v1/market/tickers"
+
+
+def top_symbols(exchange: str, n: int = 15, binance_market: str = "futures") -> list[str]:
+    """Top-n USDT markets by 24h quote volume, as 'BTCUSDT'-style symbols."""
+    try:
+        if exchange == "binance":
+            url = ("https://fapi.binance.com/fapi/v1/ticker/24hr" if binance_market == "futures"
+                   else "https://api.binance.com/api/v3/ticker/24hr")
+            r = requests.get(url, timeout=15)
+            r.raise_for_status()
+            rows = [(t["symbol"], float(t["quoteVolume"])) for t in r.json()
+                    if t["symbol"].endswith("USDT") and "_" not in t["symbol"]]
+        elif exchange == "blofin":
+            r = requests.get(BLOFIN_TICKERS, timeout=15)
+            body = r.json()
+            if body.get("code") != "0":
+                raise ExchangeError(str(body.get("msg")))
+            # volCurrency24h is base-asset volume; multiply by last price for a quote-volume ranking
+            rows = [(t["instId"].replace("-", ""), float(t["volCurrency24h"]) * float(t["last"]))
+                    for t in body["data"] if t["instId"].endswith("-USDT")]
+        else:
+            raise ExchangeError(f"Unknown exchange '{exchange}'")
+    except (requests.RequestException, ValueError, KeyError) as e:
+        raise ExchangeError(f"Could not load top symbols from {exchange}: {e}")
+    rows = [(s, v) for s, v in rows if s[:-4] not in STABLES]
+    rows.sort(key=lambda x: x[1], reverse=True)
+    return [s for s, _ in rows[:n]]

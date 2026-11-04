@@ -20,6 +20,7 @@ export TELEGRAM_BOT_TOKEN=...   # create one with @BotFather
 python bot.py
 ```
 Set `CHANNEL_ID` to also post every signal to a Telegram channel (add the bot as channel admin with "Post messages").
+Auto-scan: set `AUTO_SCAN_COUNT=15` (plus `AUTO_SCAN_TIMEFRAMES`, `AUTO_SCAN_EXCHANGES`) to scan the top coins by 24h volume; signals go to `CHANNEL_ID`.
 Commands: `/add BTCUSDT 5m blofin`, `/remove`, `/list`, `/scan ETHUSDT 15m binance`, `/chatid`.
 Optional settings are in `.env.example` (export them as env vars).
 
