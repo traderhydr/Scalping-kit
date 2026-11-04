@@ -54,6 +54,7 @@ CLOSE_GRACE = 3      # seconds to wait after a candle closes before fetching
 
 # ---------------------------------------------------------------- state
 state = {"watch": {}, "last_sig": {}}  # watch: chat_id -> [[exchange, symbol, tf]]; last_sig: key -> bar_ts
+stats = {"rounds": 0, "last_scan": 0.0, "last_scanned": 0, "last_errors": 0, "signals": 0, "markets": 0}
 checked: dict[str, int] = {}           # key -> last closed bar_ts already evaluated (in-memory)
 
 
@@ -148,6 +149,8 @@ async def scan_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 if r and r not in map(str, lst):
                     lst.append(r)
 
+    stats["markets"] = len(subs)
+    scanned = errors = 0
     for k, chats in subs.items():
         ex, sym, tf = k.split(":")
         sec = exchanges.TF_SECONDS[tf]
@@ -158,10 +161,12 @@ async def scan_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
             df = await asyncio.to_thread(analyse, ex, sym, tf)
         except Exception as e:  # noqa: BLE001
             log.warning("fetch %s failed: %s", k, e)
+            errors += 1
             continue
         if int(df["ts"].iloc[-1]) < last_closed_open * 1000:
             continue  # exchange hasn't published the new candle yet, retry next tick
         checked[k] = int(df["ts"].iloc[-1])
+        scanned += 1
         i = len(df) - 1
         if df["signal"].iloc[i] == 0 or state["last_sig"].get(k) == checked[k]:
             continue
@@ -177,10 +182,34 @@ async def scan_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 await ctx.bot.send_message(chat, text, parse_mode="HTML")
             except Exception as e:  # noqa: BLE001
                 log.warning("send to %s failed: %s", chat, e)
+        stats["signals"] += 1
         log.info("signal %s %s", k, plan.side)
+
+    stats["last_scan"], stats["last_errors"] = time.time(), errors
+    if scanned or errors:
+        stats["rounds"] += 1
+        log.info("scan round: %d candles evaluated, %d errors, %d markets watched", scanned, errors, len(subs))
 
 
 # ---------------------------------------------------------------- commands
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorised(update):
+        return
+    ago = f"{time.time() - stats['last_scan']:.0f}s ago" if stats["last_scan"] else "never"
+    newest = max(checked.values(), default=0)
+    auto = (f"Auto-scan: {AUTO_COUNT} coins x {','.join(AUTO_TFS)} on {','.join(AUTO_EXCHANGES)}"
+            if AUTO_COUNT else "Auto-scan: off")
+    await update.message.reply_text(
+        f"Markets watched: {stats['markets']}\n"
+        f"Candles evaluated: {len(checked)} markets up to date\n"
+        f"Last candle processed: {time.strftime('%H:%M UTC', time.gmtime(newest / 1000)) if newest else 'none yet'}\n"
+        f"Last scheduler tick: {ago}\n"
+        f"Fetch errors last round: {stats['last_errors']}\n"
+        f"Signals sent since start: {stats['signals']}\n"
+        + auto
+    )
+
+
 def authorised(update: Update) -> bool:
     return not ALLOWED or (update.effective_chat and update.effective_chat.id in ALLOWED)
 
@@ -205,6 +234,7 @@ HELP = (
     "/remove &lt;symbol&gt; &lt;tf&gt; [exchange] – stop watching\n"
     "/list – show watchlist\n"
     "/scan &lt;symbol&gt; &lt;tf&gt; [exchange] – analyse now\n"
+    "/status – is the scanner running\n"
     "/chatid – show this chat's id\n\n"
     "Example: <code>/add BTCUSDT 5m blofin</code>\n"
     f"Timeframes: {', '.join(exchanges.TF_SECONDS)}\n"
@@ -293,7 +323,7 @@ def main() -> None:
     load_state()
     app = Application.builder().token(TOKEN).build()
     for name, fn in [("start", cmd_start), ("help", cmd_start), ("chatid", cmd_chatid), ("add", cmd_add),
-                     ("remove", cmd_remove), ("list", cmd_list), ("scan", cmd_scan)]:
+                     ("remove", cmd_remove), ("list", cmd_list), ("scan", cmd_scan), ("status", cmd_status)]:
         app.add_handler(CommandHandler(name, fn))
     app.job_queue.run_repeating(scan_job, interval=SCAN_EVERY, first=5)
     if AUTO_COUNT and not (CHANNEL_ID or ALLOWED):
