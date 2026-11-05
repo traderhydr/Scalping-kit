@@ -354,6 +354,16 @@ async def cmd_quiet(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"✅ Quiet hours: {quiet_text()}")
 
 
+async def cmd_closeall(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stop tracking every open trade (no messages are posted to the channel)."""
+    if not authorised(update):
+        return
+    n = len(state["open"])
+    state["open"] = []
+    save_state()
+    await update.message.reply_text(f"✅ Stopped tracking {n} open trade(s). New signals will still be tracked.")
+
+
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorised(update):
         return
@@ -401,6 +411,7 @@ HELP = (
     "/list – show watchlist\n"
     "/scan &lt;symbol&gt; &lt;tf&gt; [exchange] – analyse now\n"
     "/status – is the scanner running\n"
+    "/closeall – stop tracking all open trades (TP/SL replies)\n"
     "/quiet 13:00-16:15,19:30-23:15 Europe/Madrid – no new signals in these windows (/quiet off)\n"
     "/chatid – show this chat's id\n\n"
     "Example: <code>/add BTCUSDT 5m blofin</code>\n"
@@ -490,7 +501,7 @@ def main() -> None:
     load_state()
     app = Application.builder().token(TOKEN).build()
     for name, fn in [("start", cmd_start), ("help", cmd_start), ("chatid", cmd_chatid), ("add", cmd_add),
-                     ("remove", cmd_remove), ("list", cmd_list), ("scan", cmd_scan), ("status", cmd_status), ("quiet", cmd_quiet)]:
+                     ("remove", cmd_remove), ("list", cmd_list), ("scan", cmd_scan), ("status", cmd_status), ("quiet", cmd_quiet), ("closeall", cmd_closeall)]:
         app.add_handler(CommandHandler(name, fn))
     app.job_queue.run_repeating(scan_job, interval=SCAN_EVERY, first=5)
     if AUTO_COUNT and not (CHANNEL_ID or ALLOWED):
