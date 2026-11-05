@@ -53,12 +53,13 @@ AUTO_EXCLUDE = {x.strip().upper() for x in os.environ.get(
     "AUTO_SCAN_EXCLUDE", "SOXL,SOXS,SNDK,XAU,XAG,SKHYNIX,KORU,SPCX,MU,CL,NATGAS,BZ,TSLA,NVDA,AAPL,MSTR,COIN").split(",") if x.strip()}
 QUIET_ENV = os.environ.get("QUIET_HOURS", "").strip()   # e.g. 22:00-06:00 (no new signals in this window)
 QUIET_TZ_ENV = os.environ.get("QUIET_TZ", "UTC").strip()
+COOLDOWN_MIN = int(os.environ.get("SIGNAL_COOLDOWN_MIN", 60))  # min minutes between signals on the same coin + direction
 AUTO_REFRESH = 3600  # seconds between re-ranking the top coins
 SCAN_EVERY = 15      # seconds between scheduler ticks
 CLOSE_GRACE = 3      # seconds to wait after a candle closes before fetching
 
 # ---------------------------------------------------------------- state
-state = {"watch": {}, "last_sig": {}, "open": [], "results": {"tp_hits": 0, "sl_hits": 0, "completed": 0}}  # watch: chat_id -> [[exchange, symbol, tf]]; last_sig: key -> bar_ts
+state = {"watch": {}, "last_sig": {}, "last_sym_sig": {}, "open": [], "results": {"tp_hits": 0, "sl_hits": 0, "completed": 0}}  # watch: chat_id -> [[exchange, symbol, tf]]; last_sig: key -> bar_ts
 stats = {"rounds": 0, "last_scan": 0.0, "last_scanned": 0, "last_errors": 0, "signals": 0, "markets": 0}
 checked: dict[str, int] = {}           # key -> last closed bar_ts already evaluated (in-memory)
 
@@ -77,6 +78,7 @@ def load_state() -> None:
             log.warning("Invalid QUIET_HOURS/QUIET_TZ, ignoring")
             state["quiet"] = None
     state.setdefault("open", [])
+    state.setdefault("last_sym_sig", {})
     state.setdefault("results", {"tp_hits": 0, "sl_hits": 0, "completed": 0})
 
 
@@ -135,6 +137,17 @@ def in_quiet(now: float) -> bool:
 def quiet_text() -> str:
     q = state.get("quiet")
     return ", ".join(f"{a}-{b}" for a, b in q["windows"]) + f" {q['tz']}" if q else "off"
+
+
+def duplicate_reason(sym: str, side: str, now: float) -> str | None:
+    """One signal per coin+direction: skip if already open on any exchange/timeframe, or inside the cooldown."""
+    for t in state["open"]:
+        if t["symbol"] == sym and t["side"] == side:
+            return f"already open on {t['key']}"
+    last = state["last_sym_sig"].get(f"{sym}:{side}", 0)
+    if now - last < COOLDOWN_MIN * 60:
+        return f"cooldown ({COOLDOWN_MIN} min)"
+    return None
 
 
 def key(ex: str, sym: str, tf: str) -> str:
@@ -302,6 +315,12 @@ async def scan_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
             continue
         plan = build_plan(df, i, PARAMS, RR, ENTRY_STEP_R)
         state["last_sig"][k] = checked[k]
+        why = duplicate_reason(sym, plan.side, now)
+        if why:
+            log.info("skip duplicate %s %s %s: %s", k, sym, plan.side, why)
+            save_state()
+            continue
+        state["last_sym_sig"][f"{sym}:{plan.side}"] = now
         save_state()
         text = signal_text(ex, sym, tf, plan, int(df["trend"].iloc[i]))
         targets = list(chats)
