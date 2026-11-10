@@ -32,7 +32,8 @@ log = logging.getLogger("scalpbot")
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 STATE_FILE = Path(os.environ.get("STATE_FILE", "state.json"))
 BINANCE_MARKET = os.environ.get("BINANCE_MARKET", "futures")  # futures | spot
-CHANNEL_ID = os.environ.get("CHANNEL_ID", "").strip()  # e.g. -1001234567890 or @mychannel
+# One or more channels, comma-separated, e.g. -1001234567890,@mysecondchannel
+CHANNELS = [c.strip() for c in os.environ.get("CHANNEL_ID", "").split(",") if c.strip()]
 ALLOWED = {int(x) for x in os.environ.get("ALLOWED_CHAT_IDS", "").split(",") if x.strip()}
 LEVERAGE = int(os.environ.get("LEVERAGE", 15))
 MARGIN_MODE = os.environ.get("MARGIN_MODE", "Cross").capitalize()  # Cross | Isolated
@@ -279,7 +280,7 @@ async def scan_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
             subs.setdefault(key(ex, sym, tf), []).append(int(chat))
 
     if AUTO_COUNT:
-        recipients = [CHANNEL_ID] if CHANNEL_ID else [str(c) for c in ALLOWED]
+        recipients = CHANNELS if CHANNELS else [str(c) for c in ALLOWED]
         for ex, sym, tf in await auto_markets():
             lst = subs.setdefault(key(ex, sym, tf), [])
             for r in recipients:
@@ -324,8 +325,9 @@ async def scan_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         save_state()
         text = signal_text(ex, sym, tf, plan, int(df["trend"].iloc[i]))
         targets = list(chats)
-        if CHANNEL_ID and CHANNEL_ID not in map(str, targets):
-            targets.append(CHANNEL_ID)  # every watched market's signals are also posted to the channel
+        for ch in CHANNELS:  # every watched market's signals are also posted to every channel
+            if ch not in map(str, targets):
+                targets.append(ch)
         msg_ids = {}
         for chat in targets:
             try:
@@ -523,7 +525,7 @@ def main() -> None:
                      ("remove", cmd_remove), ("list", cmd_list), ("scan", cmd_scan), ("status", cmd_status), ("quiet", cmd_quiet), ("closeall", cmd_closeall)]:
         app.add_handler(CommandHandler(name, fn))
     app.job_queue.run_repeating(scan_job, interval=SCAN_EVERY, first=5)
-    if AUTO_COUNT and not (CHANNEL_ID or ALLOWED):
+    if AUTO_COUNT and not (CHANNELS or ALLOWED):
         log.warning("AUTO_SCAN_COUNT set but neither CHANNEL_ID nor ALLOWED_CHAT_IDS - no one to send to")
     log.info("Bot started")
     app.run_polling()
