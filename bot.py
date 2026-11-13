@@ -60,7 +60,7 @@ SCAN_EVERY = 15      # seconds between scheduler ticks
 CLOSE_GRACE = 3      # seconds to wait after a candle closes before fetching
 
 # ---------------------------------------------------------------- state
-state = {"watch": {}, "last_sig": {}, "last_sym_sig": {}, "open": [], "results": {"tp_hits": 0, "sl_hits": 0, "completed": 0}}  # watch: chat_id -> [[exchange, symbol, tf]]; last_sig: key -> bar_ts
+state = {"watch": {}, "last_sig": {}, "excluded": [], "last_sym_sig": {}, "open": [], "results": {"tp_hits": 0, "sl_hits": 0, "completed": 0}}  # watch: chat_id -> [[exchange, symbol, tf]]; last_sig: key -> bar_ts
 stats = {"rounds": 0, "last_scan": 0.0, "last_scanned": 0, "last_errors": 0, "signals": 0, "markets": 0}
 checked: dict[str, int] = {}           # key -> last closed bar_ts already evaluated (in-memory)
 
@@ -78,6 +78,7 @@ def load_state() -> None:
         except Exception:  # noqa: BLE001
             log.warning("Invalid QUIET_HOURS/QUIET_TZ, ignoring")
             state["quiet"] = None
+    state.setdefault("excluded", [])
     state.setdefault("open", [])
     state.setdefault("last_sym_sig", {})
     state.setdefault("results", {"tp_hits": 0, "sl_hits": 0, "completed": 0})
@@ -87,22 +88,29 @@ def save_state() -> None:
     STATE_FILE.write_text(json.dumps(state, indent=1))
 
 
-auto_cache: dict[str, tuple[float, list[str]]] = {}  # exchange -> (fetched_at, symbols)
+auto_cache: dict[str, tuple[float, list[str]]] = {}  # exchange -> (fetched_at, unfiltered top list)
+
+
+def excluded_bases() -> set[str]:
+    return AUTO_EXCLUDE | set(state.get("excluded", []))
 
 
 async def auto_markets() -> list[tuple[str, str, str]]:
-    """Top-N coins by 24h volume on each configured exchange x timeframe."""
+    """Top-N coins by 24h volume on each configured exchange x timeframe (minus excluded coins)."""
     out = []
     for ex in AUTO_EXCHANGES:
-        ts, syms = auto_cache.get(ex, (0.0, []))
+        ts, pool = auto_cache.get(ex, (0.0, []))
         if time.time() - ts > AUTO_REFRESH:
             try:
                 pool = await asyncio.to_thread(exchanges.top_symbols, ex, AUTO_COUNT + 60, BINANCE_MARKET)
-                syms = [x for x in pool if x[:-4] not in AUTO_EXCLUDE][:AUTO_COUNT]
-                auto_cache[ex] = (time.time(), syms)
-                log.info("auto-scan %s top %d: %s", ex, AUTO_COUNT, ",".join(syms))
+                auto_cache[ex] = (time.time(), pool)
             except Exception as e:  # noqa: BLE001
                 log.warning("top symbols %s failed: %s", ex, e)
+        bad = excluded_bases()
+        syms = [x for x in pool if x[:-4] not in bad][:AUTO_COUNT]
+        if syms != getattr(auto_markets, "last", {}).get(ex):
+            log.info("auto-scan %s top %d: %s", ex, AUTO_COUNT, ",".join(syms))
+            auto_markets.last = {**getattr(auto_markets, "last", {}), ex: syms}
         out += [(ex, s, tf) for s in syms for tf in AUTO_TFS]
     return out
 
@@ -385,6 +393,33 @@ async def cmd_closeall(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"✅ Stopped tracking {n} open trade(s). New signals will still be tracked.")
 
 
+async def cmd_exclude(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/exclude AGT  - never auto-scan this coin. /exclude  - list. /include AGT  - allow it again."""
+    if not authorised(update):
+        return
+    cmd = update.message.text.split()[0].lstrip("/").split("@")[0].lower()
+    if not ctx.args:
+        extra = ", ".join(sorted(state["excluded"])) or "none"
+        await update.message.reply_text(
+            f"Excluded by you: {extra}\nBuilt-in exclusions: {', '.join(sorted(AUTO_EXCLUDE))}\n\n/exclude AGT  |  /include AGT")
+        return
+    base = ctx.args[0].upper().replace("/", "").replace("-", "")
+    for q in exchanges.QUOTES:
+        if base.endswith(q) and len(base) > len(q):
+            base = base[: -len(q)]
+            break
+    if cmd == "include":
+        if base in state["excluded"]:
+            state["excluded"].remove(base)
+        msg = f"✅ {base} is allowed again (takes effect on the next scan)"
+    else:
+        if base not in state["excluded"]:
+            state["excluded"].append(base)
+        msg = f"✅ {base} removed from auto-scan. No new signals for it (open trades keep being tracked)."
+    save_state()
+    await update.message.reply_text(msg)
+
+
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorised(update):
         return
@@ -433,6 +468,7 @@ HELP = (
     "/scan &lt;symbol&gt; &lt;tf&gt; [exchange] – analyse now\n"
     "/status – is the scanner running\n"
     "/closeall – stop tracking all open trades (TP/SL replies)\n"
+    "/exclude AGT – remove a coin from auto-scan (/include AGT to undo)\n"
     "/quiet 13:00-16:15,19:30-23:15 Europe/Madrid – no new signals in these windows (/quiet off)\n"
     "/chatid – show this chat's id\n\n"
     "Example: <code>/add BTCUSDT 5m blofin</code>\n"
@@ -522,7 +558,7 @@ def main() -> None:
     load_state()
     app = Application.builder().token(TOKEN).build()
     for name, fn in [("start", cmd_start), ("help", cmd_start), ("chatid", cmd_chatid), ("add", cmd_add),
-                     ("remove", cmd_remove), ("list", cmd_list), ("scan", cmd_scan), ("status", cmd_status), ("quiet", cmd_quiet), ("closeall", cmd_closeall)]:
+                     ("remove", cmd_remove), ("list", cmd_list), ("scan", cmd_scan), ("status", cmd_status), ("quiet", cmd_quiet), ("closeall", cmd_closeall), ("exclude", cmd_exclude), ("include", cmd_exclude)]:
         app.add_handler(CommandHandler(name, fn))
     app.job_queue.run_repeating(scan_job, interval=SCAN_EVERY, first=5)
     if AUTO_COUNT and not (CHANNELS or ALLOWED):
