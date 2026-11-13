@@ -420,6 +420,28 @@ async def cmd_exclude(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(msg)
 
 
+async def cmd_coins(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show which coins are being scanned right now."""
+    if not authorised(update):
+        return
+    lines = []
+    if AUTO_COUNT:
+        bad = excluded_bases()
+        for ex in AUTO_EXCHANGES:
+            _, pool = auto_cache.get(ex, (0.0, []))
+            syms = [x[:-4] for x in pool if x[:-4] not in bad][:AUTO_COUNT]
+            lines.append(f"{ex.upper()} ({','.join(AUTO_TFS)}): " + (", ".join(syms) if syms else "loading..."))
+    else:
+        lines.append("Auto-scan: off")
+    manual = state["watch"].get(str(update.effective_chat.id), [])
+    if manual:
+        lines.append("Your /add list: " + ", ".join(f"{s} {t} ({e})" for e, s, t in manual))
+    if state["excluded"]:
+        lines.append("Excluded: " + ", ".join(sorted(state["excluded"])))
+    lines.append("Ranked by 24h volume, refreshed hourly.")
+    await update.message.reply_text("\n\n".join(lines))
+
+
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorised(update):
         return
@@ -468,6 +490,7 @@ HELP = (
     "/scan &lt;symbol&gt; &lt;tf&gt; [exchange] – analyse now\n"
     "/status – is the scanner running\n"
     "/closeall – stop tracking all open trades (TP/SL replies)\n"
+    "/coins – which coins are being scanned\n"
     "/exclude AGT – remove a coin from auto-scan (/include AGT to undo)\n"
     "/quiet 13:00-16:15,19:30-23:15 Europe/Madrid – no new signals in these windows (/quiet off)\n"
     "/chatid – show this chat's id\n\n"
@@ -558,7 +581,7 @@ def main() -> None:
     load_state()
     app = Application.builder().token(TOKEN).build()
     for name, fn in [("start", cmd_start), ("help", cmd_start), ("chatid", cmd_chatid), ("add", cmd_add),
-                     ("remove", cmd_remove), ("list", cmd_list), ("scan", cmd_scan), ("status", cmd_status), ("quiet", cmd_quiet), ("closeall", cmd_closeall), ("exclude", cmd_exclude), ("include", cmd_exclude)]:
+                     ("remove", cmd_remove), ("list", cmd_list), ("scan", cmd_scan), ("status", cmd_status), ("quiet", cmd_quiet), ("closeall", cmd_closeall), ("coins", cmd_coins), ("exclude", cmd_exclude), ("include", cmd_exclude)]:
         app.add_handler(CommandHandler(name, fn))
     app.job_queue.run_repeating(scan_job, interval=SCAN_EVERY, first=5)
     if AUTO_COUNT and not (CHANNELS or ALLOWED):
