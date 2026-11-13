@@ -60,7 +60,7 @@ SCAN_EVERY = 15      # seconds between scheduler ticks
 CLOSE_GRACE = 3      # seconds to wait after a candle closes before fetching
 
 # ---------------------------------------------------------------- state
-state = {"watch": {}, "last_sig": {}, "excluded": [], "last_sym_sig": {}, "open": [], "results": {"tp_hits": 0, "sl_hits": 0, "completed": 0}}  # watch: chat_id -> [[exchange, symbol, tf]]; last_sig: key -> bar_ts
+state = {"watch": {}, "last_sig": {}, "tfs": None, "excluded": [], "last_sym_sig": {}, "open": [], "results": {"tp_hits": 0, "sl_hits": 0, "completed": 0}}  # watch: chat_id -> [[exchange, symbol, tf]]; last_sig: key -> bar_ts
 stats = {"rounds": 0, "last_scan": 0.0, "last_scanned": 0, "last_errors": 0, "signals": 0, "markets": 0}
 checked: dict[str, int] = {}           # key -> last closed bar_ts already evaluated (in-memory)
 
@@ -91,6 +91,12 @@ def save_state() -> None:
 auto_cache: dict[str, tuple[float, list[str]]] = {}  # exchange -> (fetched_at, unfiltered top list)
 
 
+def active_tfs() -> list[str]:
+    """Auto-scan timeframes currently enabled (changeable with /tf)."""
+    tfs = state.get("tfs")
+    return list(AUTO_TFS if tfs is None else tfs)
+
+
 def excluded_bases() -> set[str]:
     return AUTO_EXCLUDE | set(state.get("excluded", []))
 
@@ -111,7 +117,7 @@ async def auto_markets() -> list[tuple[str, str, str]]:
         if syms != getattr(auto_markets, "last", {}).get(ex):
             log.info("auto-scan %s top %d: %s", ex, AUTO_COUNT, ",".join(syms))
             auto_markets.last = {**getattr(auto_markets, "last", {}), ex: syms}
-        out += [(ex, s, tf) for s in syms for tf in AUTO_TFS]
+        out += [(ex, s, tf) for s in syms for tf in active_tfs()]
     return out
 
 
@@ -430,7 +436,7 @@ async def cmd_coins(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         for ex in AUTO_EXCHANGES:
             _, pool = auto_cache.get(ex, (0.0, []))
             syms = [x[:-4] for x in pool if x[:-4] not in bad][:AUTO_COUNT]
-            lines.append(f"{ex.upper()} ({','.join(AUTO_TFS)}): " + (", ".join(syms) if syms else "loading..."))
+            lines.append(f"{ex.upper()} ({','.join(active_tfs()) or 'none'}): " + (", ".join(syms) if syms else "loading..."))
     else:
         lines.append("Auto-scan: off")
     manual = state["watch"].get(str(update.effective_chat.id), [])
@@ -442,13 +448,39 @@ async def cmd_coins(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n\n".join(lines))
 
 
+async def cmd_tf(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/tf  - show.  /tf 5m off  - stop scanning 5m.  /tf 15m,1h on  - start scanning them."""
+    if not authorised(update):
+        return
+    cur = active_tfs()
+    if len(ctx.args) >= 2:
+        want = [x.strip().lower() for x in ctx.args[0].split(",") if x.strip()]
+        action = ctx.args[1].lower()
+        bad = [x for x in want if x not in exchanges.TF_SECONDS]
+        if bad or action not in ("on", "off", "enable", "disable", "open", "close"):
+            await update.message.reply_text(
+                f"❌ Use: /tf 5m off  or  /tf 15m,1h on\nTimeframes: {', '.join(exchanges.TF_SECONDS)}")
+            return
+        on = action in ("on", "enable", "open")
+        new = set(cur) | set(want) if on else set(cur) - set(want)
+        state["tfs"] = [t for t in exchanges.TF_SECONDS if t in new]
+        save_state()
+        cur = state["tfs"]
+    off = [t for t in exchanges.TF_SECONDS if t not in cur]
+    note = "\n⚠️ No timeframe enabled - no new auto-scan signals." if not cur else ""
+    await update.message.reply_text(
+        f"🟢 Enabled: {', '.join(cur) or 'none'}\n🔴 Disabled: {', '.join(off) or 'none'}{note}\n\n"
+        "Change: /tf 5m off  |  /tf 15m on\n"
+        "Applies to auto-scan (new signals). Open trades keep being tracked; coins you added with /add are unchanged.")
+
+
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorised(update):
         return
     ago = f"{time.time() - stats['last_scan']:.0f}s ago" if stats["last_scan"] else "never"
     newest = max(checked.values(), default=0)
     qline = f"Quiet hours: {quiet_text()}" + (" (quiet now - no new signals)" if in_quiet(time.time()) else "") + "\n"
-    auto = (f"Auto-scan: {AUTO_COUNT} coins x {','.join(AUTO_TFS)} on {','.join(AUTO_EXCHANGES)}"
+    auto = (f"Auto-scan: {AUTO_COUNT} coins x {','.join(active_tfs()) or 'none'} on {','.join(AUTO_EXCHANGES)}"
             if AUTO_COUNT else "Auto-scan: off")
     await update.message.reply_text(
         f"Markets watched: {stats['markets']}\n"
@@ -491,6 +523,7 @@ HELP = (
     "/status – is the scanner running\n"
     "/closeall – stop tracking all open trades (TP/SL replies)\n"
     "/coins – which coins are being scanned\n"
+    "/tf 5m off · /tf 15m on – enable/disable a timeframe for auto-scan\n"
     "/exclude AGT – remove a coin from auto-scan (/include AGT to undo)\n"
     "/quiet 13:00-16:15,19:30-23:15 Europe/Madrid – no new signals in these windows (/quiet off)\n"
     "/chatid – show this chat's id\n\n"
@@ -581,7 +614,7 @@ def main() -> None:
     load_state()
     app = Application.builder().token(TOKEN).build()
     for name, fn in [("start", cmd_start), ("help", cmd_start), ("chatid", cmd_chatid), ("add", cmd_add),
-                     ("remove", cmd_remove), ("list", cmd_list), ("scan", cmd_scan), ("status", cmd_status), ("quiet", cmd_quiet), ("closeall", cmd_closeall), ("coins", cmd_coins), ("exclude", cmd_exclude), ("include", cmd_exclude)]:
+                     ("remove", cmd_remove), ("list", cmd_list), ("scan", cmd_scan), ("status", cmd_status), ("quiet", cmd_quiet), ("closeall", cmd_closeall), ("coins", cmd_coins), ("tf", cmd_tf), ("exclude", cmd_exclude), ("include", cmd_exclude)]:
         app.add_handler(CommandHandler(name, fn))
     app.job_queue.run_repeating(scan_job, interval=SCAN_EVERY, first=5)
     if AUTO_COUNT and not (CHANNELS or ALLOWED):
