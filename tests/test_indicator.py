@@ -81,4 +81,6 @@ def test_backtest_stop_and_same_candle_rule():
 
 def test_backtest_short_and_fees():
     r = _run([(100.2, 98.9)], side="SHORT", fee=0.05)
-    assert r["tps"] == 1 and abs(r["net_pct"] - (0.25 - 0.10)) < 1e-9
+    # TP1 slice (25% at +1%) + the other 75% closed at the last close (99.55, +0.45%) when the data ends, minus 0.10% fees
+    assert r["tps"] == 1 and r["outcome"] == "TIMEOUT"
+    assert abs(r["net_pct"] - (0.25 * 1.0 + 0.75 * 0.45 - 0.10)) < 1e-9
