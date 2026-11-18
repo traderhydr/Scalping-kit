@@ -217,16 +217,6 @@ BE_AFTER_TP = int(os.environ.get("BREAKEVEN_AFTER_TP", 1))  # move stop to entry
 MAX_TRADE_CANDLES = 500  # stop tracking a trade that has hit nothing after this many candles
 
 
-def pct(trade: dict, price: float) -> float:
-    e = trade["entries"][0]
-    return (price - e) / e * 100 * (1 if trade["side"] == "LONG" else -1)
-
-
-def roi_text(trade: dict, price: float) -> str:
-    p = pct(trade, price)
-    return f"{p:+.2f}% price · {p * LEVERAGE:+.1f}% ROI at {MARGIN_MODE} {LEVERAGE}X"
-
-
 async def track_trades(ctx: ContextTypes.DEFAULT_TYPE, k: str, df) -> None:
     """Check candles after each open trade's signal for TP / SL hits and post updates as replies."""
     keep = []
