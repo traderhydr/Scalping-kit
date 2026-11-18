@@ -217,6 +217,17 @@ BE_AFTER_TP = int(os.environ.get("BREAKEVEN_AFTER_TP", 1))  # move stop to entry
 MAX_TRADE_CANDLES = 500  # stop tracking a trade that has hit nothing after this many candles
 
 
+def pct(trade: dict, price: float) -> float:
+    e = trade["entries"][0]
+    return (price - e) / e * 100 * (1 if trade["side"] == "LONG" else -1)
+
+
+def roi_text(trade: dict, price: float) -> str:
+    """Percentages only (price move and ROI at leverage) - never an absolute price, Cornix would read it as an entry."""
+    p = pct(trade, price)
+    return f"{p:+.2f}% price · {p * LEVERAGE:+.1f}% ROI at {MARGIN_MODE} {LEVERAGE}X"
+
+
 async def track_trades(ctx: ContextTypes.DEFAULT_TYPE, k: str, df) -> None:
     """Check candles after each open trade's signal for TP / SL hits and post updates as replies."""
     keep = []
@@ -247,14 +258,14 @@ async def track_trades(ctx: ContextTypes.DEFAULT_TYPE, k: str, df) -> None:
             msgs = []
             for n in new_hits:
                 state["results"]["tp_hits"] += 1
-                msgs.append(f"✅ {head}\nTP{n + 1} hit")
+                msgs.append(f"✅ {head}\nTP{n + 1} hit 🎯\n{roi_text(t, t['targets'][n])}")
             if sl_hit and t.get("be"):
                 state["results"]["be_hits"] = state["results"].get("be_hits", 0) + 1
                 msgs.append(f"🟰 {head}\nStopped at breakeven (after TP{t['tps_hit']})")
                 closed = True
             elif sl_hit:
                 state["results"]["sl_hits"] += 1
-                msgs.append(f"🛑 {head}\nStop loss hit")
+                msgs.append(f"🛑 {head}\nStop loss hit\n{roi_text(t, t['stop'])}")
                 closed = True
             elif t["tps_hit"] >= len(t["targets"]):
                 msgs.append(f"🏆 {head}\nAll {len(t['targets'])} targets hit")
@@ -264,7 +275,7 @@ async def track_trades(ctx: ContextTypes.DEFAULT_TYPE, k: str, df) -> None:
                 t["be"] = True
                 t["stop"] = t["entries"][0]  # breakeven = entry 1
                 k_be = BE_AFTER_TP - 1 - new_hits[0]  # attach the note to the TP that triggers it
-                msgs[min(max(k_be, 0), len(msgs) - 1)] += " (stop moved to breakeven)"
+                msgs[min(max(k_be, 0), len(msgs) - 1)] += "\n🔒 Stop moved to breakeven"
             for m in msgs:
                 for chat, mid in t["msgs"].items():
                     try:
