@@ -213,6 +213,7 @@ def analyse(ex: str, sym: str, tf: str):
     return compute(df, PARAMS)
 
 
+BE_AFTER_TP = int(os.environ.get("BREAKEVEN_AFTER_TP", 1))  # move stop to entry after this TP is hit (0 = never)
 MAX_TRADE_CANDLES = 500  # stop tracking a trade that has hit nothing after this many candles
 
 
@@ -257,15 +258,22 @@ async def track_trades(ctx: ContextTypes.DEFAULT_TYPE, k: str, df) -> None:
             for n in new_hits:
                 state["results"]["tp_hits"] += 1
                 msgs.append(f"✅ {head}\nTP{n + 1} hit 🎯\n{roi_text(t, t['targets'][n])}")
-            if sl_hit:
+            if sl_hit and t.get("be"):
+                state["results"]["be_hits"] = state["results"].get("be_hits", 0) + 1
+                msgs.append(f"🟰 {head}\nStopped at breakeven (after TP{t['tps_hit']})\nPrice returned to entry {fmt(t['stop'])}")
+                closed = True
+            elif sl_hit:
                 state["results"]["sl_hits"] += 1
-                after = f" (after TP{t['tps_hit']})" if t["tps_hit"] else ""
-                msgs.append(f"🛑 {head}\nStop loss hit{after}\n{roi_text(t, t['stop'])}")
+                msgs.append(f"🛑 {head}\nStop loss hit\n{roi_text(t, t['stop'])}")
                 closed = True
             elif t["tps_hit"] >= len(t["targets"]):
                 msgs.append(f"🏆 {head}\nAll {len(t['targets'])} targets hit")
                 state["results"]["completed"] += 1
                 closed = True
+            elif BE_AFTER_TP and new_hits and not t.get("be") and t["tps_hit"] >= BE_AFTER_TP:
+                t["be"] = True
+                t["stop"] = t["entries"][0]  # breakeven = entry 1
+                msgs[-1] += f"\n🔒 Stop moved to breakeven ({fmt(t['stop'])})"
             for m in msgs:
                 for chat, mid in t["msgs"].items():
                     try:
@@ -491,7 +499,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"Signals sent since start: {stats['signals']}\n"
         + qline +
         f"Open trades: {len(state['open'])} · TP hits: {state['results']['tp_hits']} · "
-        f"SL hits: {state['results']['sl_hits']} · Fully completed: {state['results']['completed']}\n"
+        f"SL hits: {state['results']['sl_hits']} · Breakeven: {state['results'].get('be_hits', 0)} · Fully completed: {state['results']['completed']}\n"
         + auto
     )
 
