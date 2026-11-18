@@ -55,12 +55,16 @@ AUTO_EXCLUDE = {x.strip().upper() for x in os.environ.get(
 QUIET_ENV = os.environ.get("QUIET_HOURS", "").strip()   # e.g. 22:00-06:00 (no new signals in this window)
 QUIET_TZ_ENV = os.environ.get("QUIET_TZ", "UTC").strip()
 COOLDOWN_MIN = int(os.environ.get("SIGNAL_COOLDOWN_MIN", 60))  # min minutes between signals on the same coin + direction
+FEE_PCT = float(os.environ.get("TRADE_FEE_PCT", 0.05))              # taker fee % per side, used in result tracking
+LOSER_ENABLED = os.environ.get("AUTO_REMOVE_LOSERS", "true").lower() == "true"
+LOSER_MIN_TRADES = int(os.environ.get("LOSER_MIN_TRADES", 5))        # closed trades before a coin can be judged
+LOSER_MAX_ROI = float(os.environ.get("LOSER_MAX_ROI", -30))          # remove if total ROI (% of margin) <= this
 AUTO_REFRESH = 3600  # seconds between re-ranking the top coins
 SCAN_EVERY = 15      # seconds between scheduler ticks
 CLOSE_GRACE = 3      # seconds to wait after a candle closes before fetching
 
 # ---------------------------------------------------------------- state
-state = {"watch": {}, "last_sig": {}, "tfs": None, "excluded": [], "last_sym_sig": {}, "open": [], "results": {"tp_hits": 0, "sl_hits": 0, "completed": 0}}  # watch: chat_id -> [[exchange, symbol, tf]]; last_sig: key -> bar_ts
+state = {"watch": {}, "last_sig": {}, "tfs": None, "excluded": [], "auto_excluded": {}, "coin_stats": {}, "last_sym_sig": {}, "open": [], "results": {"tp_hits": 0, "sl_hits": 0, "completed": 0}}  # watch: chat_id -> [[exchange, symbol, tf]]; last_sig: key -> bar_ts
 stats = {"rounds": 0, "last_scan": 0.0, "last_scanned": 0, "last_errors": 0, "signals": 0, "markets": 0}
 checked: dict[str, int] = {}           # key -> last closed bar_ts already evaluated (in-memory)
 
@@ -79,6 +83,8 @@ def load_state() -> None:
             log.warning("Invalid QUIET_HOURS/QUIET_TZ, ignoring")
             state["quiet"] = None
     state.setdefault("excluded", [])
+    state.setdefault("auto_excluded", {})
+    state.setdefault("coin_stats", {})
     state.setdefault("open", [])
     state.setdefault("last_sym_sig", {})
     state.setdefault("results", {"tp_hits": 0, "sl_hits": 0, "completed": 0})
@@ -228,6 +234,45 @@ def roi_text(trade: dict, price: float) -> str:
     return f"{p:+.2f}% price · {p * LEVERAGE:+.1f}% ROI at {MARGIN_MODE} {LEVERAGE}X"
 
 
+def trade_roi(t: dict, exit_price: float | None) -> float:
+    """Net result of a closed trade in % of margin: TP slices (equal weights) + remainder at exit, minus fees."""
+    n = len(t["targets"])
+    w, hits = 1.0 / n, t["tps_hit"]
+    sign = 1 if t["side"] == "LONG" else -1
+    e = t["entries"][0]
+    gross = sum(w * sign * (tp - e) / e * 100 for tp in t["targets"][:hits])
+    rem = 1.0 - hits * w
+    if rem > 1e-9 and exit_price is not None:
+        gross += rem * sign * (exit_price - e) / e * 100
+    return (gross - 2 * FEE_PCT) * LEVERAGE
+
+
+async def record_result(ctx: ContextTypes.DEFAULT_TYPE, t: dict, exit_price: float | None, outcome: str) -> None:
+    """Store a closed trade per coin and auto-remove coins that keep losing."""
+    base, _ = exchanges.normalize_symbol(t["symbol"])
+    roi = trade_roi(t, exit_price)
+    c = state["coin_stats"].setdefault(base, {"trades": 0, "wins": 0, "be": 0, "losses": 0, "roi": 0.0})
+    c["trades"] += 1
+    c["roi"] = round(c["roi"] + roi, 2)
+    if outcome == "BE":
+        c["be"] += 1
+    if roi > 0:
+        c["wins"] += 1
+    elif outcome != "BE":
+        c["losses"] += 1
+    if (LOSER_ENABLED and base not in state["excluded"] and c["trades"] >= LOSER_MIN_TRADES
+            and c["roi"] <= LOSER_MAX_ROI):
+        state["excluded"].append(base)
+        state["auto_excluded"][base] = {"trades": c["trades"], "roi": c["roi"]}
+        log.info("auto-removed losing coin %s: %d trades, %.1f%% ROI", base, c["trades"], c["roi"])
+        for chat in ALLOWED:  # private notice only - never to channels (Cornix reads them)
+            try:
+                await ctx.bot.send_message(chat, f"🚫 {base} removed from auto-scan: {c['trades']} trades, "
+                                                 f"{c['roi']:+.1f}% total ROI. /include {base} to re-enable.")
+            except Exception as e:  # noqa: BLE001
+                log.warning("loser notice to %s failed: %s", chat, e)
+
+
 async def track_trades(ctx: ContextTypes.DEFAULT_TYPE, k: str, df) -> None:
     """Check candles after each open trade's signal for TP / SL hits and post updates as replies."""
     keep = []
@@ -263,14 +308,17 @@ async def track_trades(ctx: ContextTypes.DEFAULT_TYPE, k: str, df) -> None:
                 state["results"]["be_hits"] = state["results"].get("be_hits", 0) + 1
                 msgs.append(f"🟰 {head}\nStopped at breakeven (after TP{t['tps_hit']})")
                 closed = True
+                await record_result(ctx, t, t["stop"], "BE")
             elif sl_hit:
                 state["results"]["sl_hits"] += 1
                 msgs.append(f"🛑 {head}\nStop loss hit\n{roi_text(t, t['stop'])}")
                 closed = True
+                await record_result(ctx, t, t["stop"], "SL")
             elif t["tps_hit"] >= len(t["targets"]):
                 msgs.append(f"🏆 {head}\nAll {len(t['targets'])} targets hit")
                 state["results"]["completed"] += 1
                 closed = True
+                await record_result(ctx, t, None, "TP")
             elif BE_AFTER_TP and new_hits and not t.get("be") and t["tps_hit"] >= BE_AFTER_TP:
                 t["be"] = True
                 t["stop"] = t["entries"][0]  # breakeven = entry 1
@@ -427,6 +475,8 @@ async def cmd_exclude(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if cmd == "include":
         if base in state["excluded"]:
             state["excluded"].remove(base)
+        state["auto_excluded"].pop(base, None)
+        state["coin_stats"].pop(base, None)  # fresh start so it isn't instantly removed again
         msg = f"✅ {base} is allowed again (takes effect on the next scan)"
     else:
         if base not in state["excluded"]:
@@ -484,6 +534,45 @@ async def cmd_tf(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "Applies to auto-scan (new signals). Open trades keep being tracked; coins you added with /add are unchanged.")
 
 
+async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Results per coin (closed trades, net of fees, % of margin at the configured leverage)."""
+    if not authorised(update):
+        return
+    cs = state["coin_stats"]
+    if not cs:
+        await update.message.reply_text("No closed trades yet.")
+        return
+    tot = sum(c["trades"] for c in cs.values())
+    wins = sum(c["wins"] for c in cs.values())
+    roi = sum(c["roi"] for c in cs.values())
+    rows = sorted(cs.items(), key=lambda kv: kv[1]["roi"], reverse=True)
+    lines = [f"Closed trades: {tot} · win rate {wins / tot * 100:.0f}% · total {roi:+.1f}% of margin "
+             f"({MARGIN_MODE} {LEVERAGE}X, fees {FEE_PCT}%/side)", ""]
+    for b, c in rows:
+        flag = " 🚫" if b in state["auto_excluded"] else ""
+        lines.append(f"{b}: {c['trades']} trades · {c['wins']}W {c['be']}BE {c['losses']}L · {c['roi']:+.1f}%{flag}")
+    if state["auto_excluded"]:
+        lines.append(f"\n🚫 auto-removed (≥{LOSER_MIN_TRADES} trades and ≤{LOSER_MAX_ROI:g}%): "
+                     + ", ".join(state["auto_excluded"]) + "  → /include COIN to re-enable")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_trades(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Open trades and how far each has progressed."""
+    if not authorised(update):
+        return
+    if not state["open"]:
+        await update.message.reply_text("No open trades.")
+        return
+    lines = []
+    for t in state["open"]:
+        base, quote = exchanges.normalize_symbol(t["symbol"])
+        be = " · stop at breakeven" if t.get("be") else ""
+        lines.append(f"{'🟢' if t['side'] == 'LONG' else '🔴'} #{base}/{quote} {t['side']} · {t['key'].split(':')[2]} "
+                     f"({t['key'].split(':')[0]}) — TP {t['tps_hit']}/{len(t['targets'])}{be}")
+    await update.message.reply_text(f"Open trades: {len(state['open'])}\n" + "\n".join(lines))
+
+
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorised(update):
         return
@@ -534,6 +623,7 @@ HELP = (
     "/closeall – stop tracking all open trades (TP/SL replies)\n"
     "/coins – which coins are being scanned\n"
     "/tf 5m off · /tf 15m on – enable/disable a timeframe for auto-scan\n"
+    "/stats – results per coin · /trades – open trades\n"
     "/exclude AGT – remove a coin from auto-scan (/include AGT to undo)\n"
     "/quiet 13:00-16:15,19:30-23:15 Europe/Madrid – no new signals in these windows (/quiet off)\n"
     "/chatid – show this chat's id\n\n"
@@ -624,7 +714,7 @@ def main() -> None:
     load_state()
     app = Application.builder().token(TOKEN).build()
     for name, fn in [("start", cmd_start), ("help", cmd_start), ("chatid", cmd_chatid), ("add", cmd_add),
-                     ("remove", cmd_remove), ("list", cmd_list), ("scan", cmd_scan), ("status", cmd_status), ("quiet", cmd_quiet), ("closeall", cmd_closeall), ("coins", cmd_coins), ("tf", cmd_tf), ("exclude", cmd_exclude), ("include", cmd_exclude)]:
+                     ("remove", cmd_remove), ("list", cmd_list), ("scan", cmd_scan), ("status", cmd_status), ("quiet", cmd_quiet), ("closeall", cmd_closeall), ("coins", cmd_coins), ("tf", cmd_tf), ("stats", cmd_stats), ("trades", cmd_trades), ("exclude", cmd_exclude), ("include", cmd_exclude)]:
         app.add_handler(CommandHandler(name, fn))
     app.job_queue.run_repeating(scan_job, interval=SCAN_EVERY, first=5)
     if AUTO_COUNT and not (CHANNELS or ALLOWED):
