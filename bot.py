@@ -257,14 +257,14 @@ async def track_trades(ctx: ContextTypes.DEFAULT_TYPE, k: str, df) -> None:
             msgs = []
             for n in new_hits:
                 state["results"]["tp_hits"] += 1
-                msgs.append(f"✅ {head}\nTP{n + 1} hit 🎯\n{roi_text(t, t['targets'][n])}")
+                msgs.append(f"✅ {head}\nTP{n + 1} hit")
             if sl_hit and t.get("be"):
                 state["results"]["be_hits"] = state["results"].get("be_hits", 0) + 1
-                msgs.append(f"🟰 {head}\nStopped at breakeven (after TP{t['tps_hit']})\nPrice returned to entry {fmt(t['stop'])}")
+                msgs.append(f"🟰 {head}\nStopped at breakeven (after TP{t['tps_hit']})")
                 closed = True
             elif sl_hit:
                 state["results"]["sl_hits"] += 1
-                msgs.append(f"🛑 {head}\nStop loss hit\n{roi_text(t, t['stop'])}")
+                msgs.append(f"🛑 {head}\nStop loss hit")
                 closed = True
             elif t["tps_hit"] >= len(t["targets"]):
                 msgs.append(f"🏆 {head}\nAll {len(t['targets'])} targets hit")
@@ -273,7 +273,8 @@ async def track_trades(ctx: ContextTypes.DEFAULT_TYPE, k: str, df) -> None:
             elif BE_AFTER_TP and new_hits and not t.get("be") and t["tps_hit"] >= BE_AFTER_TP:
                 t["be"] = True
                 t["stop"] = t["entries"][0]  # breakeven = entry 1
-                msgs[-1] += f"\n🔒 Stop moved to breakeven ({fmt(t['stop'])})"
+                k_be = BE_AFTER_TP - 1 - new_hits[0]  # attach the note to the TP that triggers it
+                msgs[min(max(k_be, 0), len(msgs) - 1)] += " (stop moved to breakeven)"
             for m in msgs:
                 for chat, mid in t["msgs"].items():
                     try:
