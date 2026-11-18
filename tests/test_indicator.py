@@ -47,3 +47,38 @@ def test_trade_plan_geometry():
 def test_symbol_normalisation():
     for s in ("BTCUSDT", "btc/usdt", "BTC-USDT", "BTCUSDT.P"):
         assert normalize_symbol(s) == ("BTC", "USDT")
+
+
+def _plan(side="LONG"):
+    from trade import TradePlan
+    if side == "LONG":
+        return TradePlan("LONG", [100, 99.9, 99.8], 98.0, [101, 102, 103, 105], [1] * 4, 0)
+    return TradePlan("SHORT", [100, 100.1, 100.2], 102.0, [99, 98, 97, 95], [1] * 4, 0)
+
+
+def _run(rows, side="LONG", be_after=1, fee=0.0, slip=0.0):
+    import backtest
+    df = pd.DataFrame([{"ts": k, "high": h, "low": l, "close": (h + l) / 2} for k, (h, l) in enumerate([(100, 100)] + rows)])
+    return backtest.simulate(df, 0, _plan(side), be_after, 100, 15, fee, slip)
+
+
+def test_backtest_all_targets_hit():
+    r = _run([(106, 100.5)])
+    assert r["outcome"] == "ALL_TP" and r["tps"] == 4
+    assert abs(r["gross_pct"] - (1 + 2 + 3 + 5) / 4) < 1e-9          # 25% slice at each TP
+
+
+def test_backtest_breakeven_after_tp1():
+    r = _run([(101.5, 100.2), (100.5, 99.9)])                          # TP1, then back to entry
+    assert r["outcome"] == "BE" and r["tps"] == 1
+    assert abs(r["gross_pct"] - 0.25 * 1.0) < 1e-9                     # only the TP1 slice banked
+
+
+def test_backtest_stop_and_same_candle_rule():
+    assert _run([(100.5, 97.9)])["outcome"] == "SL"
+    assert _run([(101.5, 97.5)])["outcome"] == "SL"                    # stop wins if a candle touches both
+
+
+def test_backtest_short_and_fees():
+    r = _run([(100.2, 98.9)], side="SHORT", fee=0.05)
+    assert r["tps"] == 1 and abs(r["net_pct"] - (0.25 - 0.10)) < 1e-9

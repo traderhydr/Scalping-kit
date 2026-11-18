@@ -24,7 +24,7 @@ class TradePlan:
 
 
 def build_plan(df: pd.DataFrame, i: int, p: Params, rr: tuple[float, ...] = (0.5, 1.0, 1.5, 2.5), entry_step_r: float = 0.15,
-               atr_len: int = 14, atr_buffer: float = 0.1) -> TradePlan:
+               atr_len: int = 14, atr_buffer: float = 0.1, min_stop_pct: float = 0.0) -> TradePlan:
     """df is the output of indicator.compute; i is the index of the signal bar.
 
     Entry = close of the signal candle (real price, not Heikin Ashi).
@@ -45,12 +45,14 @@ def build_plan(df: pd.DataFrame, i: int, p: Params, rr: tuple[float, ...] = (0.5
     # deeper into the pullback (lower for LONG, higher for SHORT).
     if side == 1:
         stop = float(window["low"].min()) - atr_buffer * atr
-        risk = entry - stop
+        risk = max(entry - stop, entry * min_stop_pct / 100)  # optionally widen very tight stops
+        stop = entry - risk
         targets = [entry + r * risk for r in rr]
         entries = [entry - k * entry_step_r * risk for k in range(3)]
     else:
         stop = float(window["high"].max()) + atr_buffer * atr
-        risk = stop - entry
+        risk = max(stop - entry, entry * min_stop_pct / 100)
+        stop = entry + risk
         targets = [entry - r * risk for r in rr]
         entries = [entry + k * entry_step_r * risk for k in range(3)]
     return TradePlan("LONG" if side == 1 else "SHORT", entries, stop, targets, list(rr), int(df["ts"].iloc[i]))

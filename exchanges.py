@@ -129,3 +129,71 @@ def top_symbols(exchange: str, n: int = 15, binance_market: str = "futures") -> 
     rows = [(s, v) for s, v in rows if s[:-4] not in STABLES]
     rows.sort(key=lambda x: x[1], reverse=True)
     return [s for s, _ in rows[:n]]
+
+
+# Non-crypto / tokenised-stock / commodity perps that rank high on volume.
+DEFAULT_EXCLUDE = ("SOXL", "SOXS", "SNDK", "XAU", "XAG", "SKHYNIX", "KORU", "SPCX", "MU", "CL",
+                   "NATGAS", "BZ", "TSLA", "NVDA", "AAPL", "MSTR", "COIN")
+
+
+def fetch_history(exchange: str, symbol: str, tf: str, days: float, warmup: int = 400,
+                  binance_market: str = "futures") -> pd.DataFrame:
+    """Closed candles covering the last `days` days plus `warmup` extra candles (for EMA warm-up)."""
+    if tf not in TF_SECONDS:
+        raise ExchangeError(f"Unsupported timeframe '{tf}'")
+    base, quote = normalize_symbol(symbol)
+    sec = TF_SECONDS[tf]
+    now_ms = int(time.time() * 1000)
+    start_ms = now_ms - int(days * 86400_000) - warmup * sec * 1000
+    rows: list[list[float]] = []
+    if exchange == "binance":
+        last_err = None
+        for m in [binance_market] + [x for x in BINANCE_HOSTS if x != binance_market]:
+            rows, cursor = [], start_ms
+            try:
+                while cursor < now_ms:
+                    r = requests.get(BINANCE_HOSTS[m], params={
+                        "symbol": base + quote, "interval": tf, "limit": 1000, "startTime": cursor}, timeout=20)
+                    if r.status_code != 200:
+                        raise ExchangeError(f"Binance {m} HTTP {r.status_code}: {r.text[:100]}")
+                    chunk = r.json()
+                    if not chunk:
+                        break
+                    rows += [[k[0], k[1], k[2], k[3], k[4]] for k in chunk]
+                    cursor = chunk[-1][0] + 1
+                    if len(chunk) < 1000:
+                        break
+                    time.sleep(0.15)
+                if rows:
+                    break
+            except (requests.RequestException, ExchangeError, ValueError) as e:
+                last_err = e
+        if not rows:
+            raise ExchangeError(str(last_err or "no data"))
+    elif exchange == "blofin":
+        after = None
+        for _ in range(500):
+            params = {"instId": f"{base}-{quote}", "bar": BLOFIN_BAR.get(tf, tf), "limit": 1000}
+            if after:
+                params["after"] = after
+            try:
+                body = requests.get(BLOFIN_URL, params=params, timeout=20).json()
+            except (requests.RequestException, ValueError) as e:
+                raise ExchangeError(f"BloFin request failed: {e}")
+            if body.get("code") != "0":
+                raise ExchangeError(f"BloFin error: {body.get('msg') or body}")
+            chunk = body.get("data", [])
+            if not chunk:
+                break
+            rows += [[c[0], c[1], c[2], c[3], c[4]] for c in chunk]
+            oldest = min(int(c[0]) for c in chunk)
+            if oldest <= start_ms:
+                break
+            after = str(oldest)
+            time.sleep(0.15)
+        if not rows:
+            raise ExchangeError("BloFin returned no candles")
+    else:
+        raise ExchangeError(f"Unknown exchange '{exchange}'")
+    df = _drop_unclosed(_frame(rows), tf)
+    return df[df["ts"] >= start_ms].reset_index(drop=True)

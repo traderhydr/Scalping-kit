@@ -51,7 +51,7 @@ AUTO_TFS = [x.strip() for x in os.environ.get("AUTO_SCAN_TIMEFRAMES", "5m").spli
 AUTO_EXCHANGES = [x.strip() for x in os.environ.get("AUTO_SCAN_EXCHANGES", "binance").split(",") if x.strip()]
 # Non-crypto / tokenised-stock / commodity perps that rank high on volume; override with AUTO_SCAN_EXCLUDE
 AUTO_EXCLUDE = {x.strip().upper() for x in os.environ.get(
-    "AUTO_SCAN_EXCLUDE", "SOXL,SOXS,SNDK,XAU,XAG,SKHYNIX,KORU,SPCX,MU,CL,NATGAS,BZ,TSLA,NVDA,AAPL,MSTR,COIN").split(",") if x.strip()}
+    "AUTO_SCAN_EXCLUDE", ",".join(exchanges.DEFAULT_EXCLUDE)).split(",") if x.strip()}
 QUIET_ENV = os.environ.get("QUIET_HOURS", "").strip()   # e.g. 22:00-06:00 (no new signals in this window)
 QUIET_TZ_ENV = os.environ.get("QUIET_TZ", "UTC").strip()
 COOLDOWN_MIN = int(os.environ.get("SIGNAL_COOLDOWN_MIN", 60))  # min minutes between signals on the same coin + direction
